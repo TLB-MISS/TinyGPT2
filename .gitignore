@@ -1,5 +1,6 @@
 # dataset and model
-*gpt2*/
+gpt2/
+distilgpt2/
 cache/
 __pycache__/
 *test*/
