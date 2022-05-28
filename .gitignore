@@ -1,0 +1,6 @@
+# dataset and model
+*gpt2*/
+cache/
+__pycache__/
+*test*/
+.venv/

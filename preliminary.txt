@@ -1,0 +1,27 @@
+make virtual environment
+	$virtualenv .venv --python=python3.7
+	$source .venv/bin/activate
+	$pip3 install -r requirements.txt
+
+download pretrained BERT_BASE from Huggingface
+	$wget https://github.com/git-lfs/git-lfs/releases/download/v2.10.0/git-lfs-linux-386-v2.10.0.tar.gz
+	$tar -xvf git-lfs-linux-386-v2.10.0.tar.gz
+	$chmod 755 install.sh
+	$vi ./install.sh  # change prefix variable to appropriage path
+	$mv bin/git-lfs VALIDPATH
+	$bash ./install.sh
+	$git lfs install 
+	$git clone https://huggingface.co/bert-base-uncased
+
+download the Openwebtext datasets from Huggingface
+	$python3
+	>>from datasets import load_dataset
+	>>dataset = load_dataset("openwebtext", cache_dir=CACHE_DIR)
+	>>dataset.save_to_disk(FILE_PATH)
+
+make some directories
+	$mkdir corpus_json
+	$mkdir student_model  # move these directories to disk with enough storage
+
+make json file for training
+	$python3 preprocess.py --output_dir=OUTPUT_DIR --dataset_dir=DATASET_DIR
