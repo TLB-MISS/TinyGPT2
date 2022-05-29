@@ -523,10 +523,7 @@ def main():
                                 for key in sorted(result.keys()):
                                     logger.info("  %s = %s", key, str(result[key]))
                                     writer.write("%s = %s\n" % (key, str(result[key])))
-                            # barrier until saving log file
                             logging.info("lr : {}".format(lr_scheduler.get_lr()))
-                            if args.local_rank != -1:
-                                torch.distributed.barrier()
                         
                         if global_step % args.model_save_step == 0:
                             # Save a trained model
@@ -540,9 +537,6 @@ def main():
 
                             torch.save(model_to_save.state_dict(), output_model_file)
                             model_to_save.config.to_json_file(output_config_file)
-                            # barrier until saving model
-                            if args.local_rank != -1:
-                                torch.distributed.barrier()
 
             if args.local_rank in [-1, 0]:
                 model_name = "step_{}_{}".format(global_step, WEIGHTS_NAME)
@@ -565,10 +559,6 @@ def main():
                 }, output_optim_file)
                 logging.info("global step : {},   lr : {}".format(global_step, lr_scheduler.get_lr()))
 
-                # barrier until saving model and optim state
-                if args.local_rank != -1:
-                    torch.distributed.barrier()
-            
             # remove cache directory when before starting next epoch
             if args.local_rank in [-1, 0]:
                 cache_dir = os.path.join(args.working_dir, "cache")
