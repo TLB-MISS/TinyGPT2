@@ -45,11 +45,11 @@ def convert_example_to_features(example, max_seq_length):
         attention_mask = [1] * len(input_ids)
     
     if len(input_ids) > max_seq_length:
-        logger.info('len(tokens): {}'.format(len(input_ids)))
-        logger.info('max_seq_length: {}'.format(max_seq_length))
         input_ids = input_ids[:max_seq_length]
         attention_mask = attention_mask[:max_seq_length]
 
+    # It will not occur that the case of [max_seq_length > len(input_ids)]
+    # but if it happened, fill input_array[len(input_ids):] with pad token
     input_array = np.zeros(max_seq_length, dtype=np.int32)
     input_array[:len(input_ids)] = input_ids
 
@@ -62,7 +62,7 @@ def convert_example_to_features(example, max_seq_length):
 
 
 class PregeneratedDataset(Dataset):
-    def __init__(self, training_path, local_rank, max_seq_len=1024, working_dir=None, reduce_memory=False):
+    def __init__(self, training_path, local_rank, max_seq_len, working_dir=None, reduce_memory=False):
         #self.epoch = epoch
         #self.data_epoch = int(epoch % num_data_epochs)
         logger.info('training_path: {}'.format(training_path))
@@ -175,7 +175,7 @@ def get_learning_rate_scheduler(optimizer, args, max_steps):
 def soft_cross_entropy(predicts, targets):
     student_likelihood = torch.nn.functional.log_softmax(predicts, dim=-1)
     targets_prob = torch.nn.functional.softmax(targets, dim=-1)
-    return (- targets_prob * student_likelihood).mean()
+    return (- targets_prob * student_likelihood).sum(dim=-1).mean()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -360,7 +360,10 @@ def main():
     # Use "GPT2LMHeadModel" to investigate the effect of distillation of prediction layer on distillation performance. 
     # If the prediction layer does not have a good effect on the distillation performance, replace it with "GPT2Model".
     # teacher_model = GPT2Model.from_pretrained(args.teacher_model)
-    teacher_model = GPT2LMHeadModel.from_pretrained(args.teacher_model)
+    if student_model_config.use_prediction_distill:
+        teacher_model = GPT2LMHeadModel.from_pretrained(args.teacher_model)
+    else:
+        teacher_model = GPT2Model.from_pretrained(args.teacher_model)
 
     student_model.to(device)
     teacher_model.to(device)
@@ -404,8 +407,9 @@ def main():
         logging.info("***** Running training *****")
         logging.info("  Num examples = {}".format(total_train_examples))
         logging.info("  Batch size = %d", batch_size)
-        logging.info("  gradient_accumulation_steps = %d", args.gradient_accumulation_steps)
-        logging.info("  Num steps = %d", num_train_optimization_steps)
+        logging.info("  Gradient accumulation steps = %d", args.gradient_accumulation_steps)
+        logging.info("  Total batch size = %d", batch_size*args.gradient_accumulation_steps)
+        logging.info("  Num global steps = %d", num_train_optimization_steps)
 
     global_step = start_step
     for epoch in trange(start_epoch, args.num_train_epochs, desc="Epoch"):
@@ -437,38 +441,40 @@ def main():
                 logit_loss = 0.
 
                 student_output = student_model(input_ids=input_ids, attention_mask=attention_mask)
-                student_logits, student_reps, student_atts = student_output.logits, student_output.hidden_states, student_output.attentions
-
                 teacher_output = teacher_model(input_ids=input_ids, attention_mask=attention_mask)
-                teacher_logits, teacher_reps, teacher_atts = teacher_output.logits, teacher_output.hidden_states, teacher_output.attentions
+                if student_model_config.use_prediction_distill:
+                    student_logits, student_reps, student_atts = student_output.logits, student_output.hidden_states, student_output.attentions
+                    teacher_logits, teacher_reps, teacher_atts = teacher_output.logits, teacher_output.hidden_states, teacher_output.attentions
+                    teacher_logits = teacher_logits.detach()
+                else:
+                    student_reps, student_atts = student_output.hidden_states, student_output.attentions
+                    teacher_reps, teacher_atts = teacher_output.hidden_states, teacher_output.attentions
+
                 teacher_reps = [teacher_rep.detach() for teacher_rep in teacher_reps]  # speedup 1.5x
                 teacher_atts = [teacher_att.detach() for teacher_att in teacher_atts]
-                teacher_logits = teacher_logits.detach()
 
                 teacher_layer_num = len(teacher_atts)
                 student_layer_num = len(student_atts)
-                # assert teacher_layer_num % student_layer_num == 0
+                assert teacher_layer_num % student_layer_num == 0
                 layers_per_block = int(teacher_layer_num / student_layer_num)
-                new_teacher_atts = [teacher_atts[i * layers_per_block + layers_per_block - 1]
+                teacher_atts = [teacher_atts[i * layers_per_block + layers_per_block - 1]
                                     for i in range(student_layer_num)]
 
-                for student_att, teacher_att in zip(student_atts, new_teacher_atts):
+                for student_att, teacher_att in zip(student_atts, teacher_atts):
                     student_att = torch.where(student_att <= -1e2, torch.zeros_like(student_att).to(device),
                                               student_att)
                     teacher_att = torch.where(teacher_att <= -1e2, torch.zeros_like(teacher_att).to(device),
                                               teacher_att)
-                    att_loss += loss_mse(student_att, teacher_att)
+                    att_loss += loss_mse(student_att, teacher_att) * (2*max_seq_len / (max_seq_len+1))
 
-                new_teacher_reps = [teacher_reps[i * layers_per_block] for i in range(student_layer_num + 1)]
+                teacher_reps = [teacher_reps[i * layers_per_block] for i in range(student_layer_num + 1)]
 
-                for student_rep, teacher_rep in zip(student_reps, new_teacher_reps):
+                for student_rep, teacher_rep in zip(student_reps, teacher_reps):
                     rep_loss += loss_mse(student_rep, teacher_rep)
 
                 if student_model_config.use_prediction_distill:
                     logit_loss += soft_cross_entropy(student_logits / args.temperature,
                                                         teacher_logits / args.temperature)
-                else:
-                    student_logits = student_logits.detach()
 
                 if n_gpu > 1:
                     # mean() to average on multi-gpu parallel training
@@ -485,7 +491,6 @@ def main():
                 loss = att_loss + rep_loss
                 if student_model_config.use_prediction_distill:
                     loss += logit_loss
-                loss = rep_loss
                 loss.backward()
 
                 tr_att_loss += att_loss.item()
@@ -497,17 +502,17 @@ def main():
                 nb_tr_steps += 1
                 pbar.update(1)
 
-                mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-                mean_att_loss = tr_att_loss * args.gradient_accumulation_steps / nb_tr_steps
-                mean_rep_loss = tr_rep_loss * args.gradient_accumulation_steps / nb_tr_steps
-                if student_model_config.use_prediction_distill:
-                    mean_logit_loss = tr_logit_loss * args.gradient_accumulation_steps / nb_tr_steps
-
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
+
+                    mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
+                    mean_att_loss = tr_att_loss * args.gradient_accumulation_steps / nb_tr_steps
+                    mean_rep_loss = tr_rep_loss * args.gradient_accumulation_steps / nb_tr_steps
+                    if student_model_config.use_prediction_distill:
+                        mean_logit_loss = tr_logit_loss * args.gradient_accumulation_steps / nb_tr_steps
                     if args.local_rank in [-1, 0]:
                         if global_step % args.eval_step == 0:
                             result = {}

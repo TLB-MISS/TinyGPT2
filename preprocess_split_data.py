@@ -19,10 +19,8 @@ def main():
 	tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 
 	# Process the dataset and split it into train and test subsets
-	dataset = dataset.map(lambda e: tokenizer(e['text'], max_length=1024, truncation=True))
+	dataset = dataset.map(lambda e: tokenizer(e['text']))
 	dataset = dataset['train']
-	print(dataset)
-	dataset = dataset.filter(lambda e: len(e['input_ids']) >= 100)
 	print(dataset)
 
 	dataset = dataset.remove_columns('text')
