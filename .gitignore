@@ -6,3 +6,4 @@ __pycache__/
 *test*/
 .venv/
 student_step*/
+general_distill_exp.py
