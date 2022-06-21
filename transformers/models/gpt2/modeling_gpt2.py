@@ -187,9 +187,11 @@ class GPT2Attention(nn.Module):
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
+        attn_scores = None
 
         if self.scale_attn_weights:
             attn_weights = attn_weights / (value.size(-1) ** 0.5)
+            attn_scores = attn_weights
 
         # Layer-wise attention scaling
         if self.scale_attn_by_inverse_layer_idx:
@@ -200,10 +202,13 @@ class GPT2Attention(nn.Module):
             query_length, key_length = query.size(-2), key.size(-2)
             causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].bool()
             attn_weights = torch.where(causal_mask, attn_weights, self.masked_bias.to(attn_weights.dtype))
+            attn_scores = torch.mul(attn_scores, causal_mask)
+            
 
         if attention_mask is not None:
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
+            attn_scores = attn_scores + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -217,7 +222,7 @@ class GPT2Attention(nn.Module):
 
         attn_output = torch.matmul(attn_weights, value)
 
-        return attn_output, attn_weights
+        return attn_output, attn_weights, attn_scores
 
     def _upcast_and_reordered_attn(self, query, key, value, attention_mask=None, head_mask=None):
         # Use `torch.baddbmm` (a bit more efficient w/ alpha param for scaling -- from Megatron-LM)
@@ -251,7 +256,7 @@ class GPT2Attention(nn.Module):
             query_length, key_length = query.size(-2), key.size(-2)
             causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].bool()
             attn_weights = torch.where(causal_mask, attn_weights, self.masked_bias.to(attn_weights.dtype))
-
+            
         if attention_mask is not None:
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
@@ -329,7 +334,7 @@ class GPT2Attention(nn.Module):
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask)
         else:
-            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+            attn_output, attn_weights, attn_scores = self._attn(query, key, value, attention_mask, head_mask)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
@@ -338,8 +343,8 @@ class GPT2Attention(nn.Module):
         outputs = (attn_output, present)
         if output_attentions:
             outputs += (attn_weights,)
-
-        return outputs  # a, present, (attentions)
+        
+        return outputs, attn_scores  # a, present, (attentions)
 
 
 class GPT2MLP(nn.Module):
@@ -388,7 +393,7 @@ class GPT2Block(nn.Module):
     ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        attn_outputs = self.attn(
+        attn_outputs, attn_scores = self.attn(
             hidden_states,
             layer_past=layer_past,
             attention_mask=attention_mask,
@@ -410,7 +415,7 @@ class GPT2Block(nn.Module):
                 )
             residual = hidden_states
             hidden_states = self.ln_cross_attn(hidden_states)
-            cross_attn_outputs = self.crossattention(
+            cross_attn_outputs, _ = self.crossattention(
                 hidden_states,
                 attention_mask=attention_mask,
                 head_mask=head_mask,
@@ -434,7 +439,7 @@ class GPT2Block(nn.Module):
         else:
             outputs = (hidden_states,) + outputs[1:]
 
-        return outputs  # hidden_states, present, (attentions, cross_attentions)
+        return outputs, attn_scores  # hidden_states, present, (attentions, cross_attentions)
 
 
 class GPT2PreTrainedModel(PreTrainedModel):
@@ -844,6 +849,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
+        all_self_attention_scores = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
@@ -877,7 +883,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
                     return custom_forward
 
-                outputs = torch.utils.checkpoint.checkpoint(
+                outputs, attn_scores = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     hidden_states,
                     None,
@@ -887,7 +893,7 @@ class GPT2Model(GPT2PreTrainedModel):
                     encoder_attention_mask,
                 )
             else:
-                outputs = block(
+                outputs, attn_scores = block(
                     hidden_states,
                     layer_past=layer_past,
                     attention_mask=attention_mask,
@@ -904,6 +910,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
+                all_self_attention_scores = all_self_attention_scores + (attn_scores,)
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
 
@@ -923,15 +930,15 @@ class GPT2Model(GPT2PreTrainedModel):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
+                for v in [hidden_states, presents, all_hidden_states, all_self_attention_scores, all_cross_attentions]#all_self_attentions, all_cross_attentions]
                 if v is not None
             )
-
+        
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=presents,
             hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
+            attentions=all_self_attention_scores,#all_self_attentions,
             cross_attentions=all_cross_attentions,
         )
 
@@ -1116,7 +1123,10 @@ class TinyGPT2Model(GPT2PreTrainedModel):
         super().__init__(config)
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.fit_dense = nn.Linear(config.n_embd, fit_size)
+        if config.n_embd == fit_size:
+            self.fit_dense = None
+        else:
+            self.fit_dense = nn.Linear(config.n_embd, fit_size)
 
         # Model parallel
         self.model_parallel = False
@@ -1135,7 +1145,8 @@ class TinyGPT2Model(GPT2PreTrainedModel):
         assert_device_map(self.device_map, len(self.transformer.h))
         self.transformer.parallelize(self.device_map)
         self.lm_head = self.lm_head.to(self.transformer.first_device)
-        self.fit_dense = self.fit_dense.to(self.transformer.first_device)
+        if self.fit_dense is not None:
+            self.fit_dense = self.fit_dense.to(self.transformer.first_device)
         self.model_parallel = True
 
     @add_start_docstrings(DEPARALLELIZE_DOCSTRING)
@@ -1143,7 +1154,8 @@ class TinyGPT2Model(GPT2PreTrainedModel):
         self.transformer.deparallelize()
         self.transformer = self.transformer.to("cpu")
         self.lm_head = self.lm_head.to("cpu")
-        self.fit_dense = self.fit_dense.to("cpu")
+        if self.fit_dense is not None:
+            self.fit_dense = self.fit_dense.to("cpu")
         self.model_parallel = False
         torch.cuda.empty_cache()
 
@@ -1251,14 +1263,18 @@ class TinyGPT2Model(GPT2PreTrainedModel):
             return ((loss,) + output) if loss is not None else output
         
         # Set distillation matrix
+        
         hidden_states_ret = []
         if transformer_outputs.hidden_states is not None:
             for layer_id, sequence_layer in enumerate(transformer_outputs.hidden_states):
-                hidden_states_ret.append(self.fit_dense(sequence_layer))
+                if self.fit_dense is not None:
+                    hidden_states_ret.append(self.fit_dense(sequence_layer))
+                else:
+                    hidden_states_ret.append(sequence_layer)
             hidden_states_ret = tuple(hidden_states_ret)
         else:
             hidden_states_ret = None
-
+        
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
