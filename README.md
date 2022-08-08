@@ -24,7 +24,7 @@ BERT has Post-LN structures, so the scale of FFN residual block output is stable
 
 ## Environment settings
 
-Please see preliminary.txt.
+Please see `preliminary.txt`.
 
 ## Pretrain
 
